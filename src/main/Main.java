@@ -1,7 +1,5 @@
 package main;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -47,8 +45,7 @@ public class Main
 	private static final MessageDigest OUT_DIGEST = DIGEST_SUPPLIER.get();
 	private static final MessageDigest IN_DIGEST = DIGEST_SUPPLIER.get();
 	static final short KB = 1024;
-	static final int MB = KB * 1024;
-	static final int GB = MB * 1024;
+	static final int MB = KB * 1024, GB = MB * 1024, MAX_BUFFER = MB * 20;
 	static
 	{
 		final OptionGroup group = new OptionGroup();
@@ -63,6 +60,7 @@ public class Main
 	public static void main(String[] args)
 	{
 		final BufferedReader reader = new BufferedReader(new InputStreamReader(System.in));
+		final long startTime;
 		try
 		{
 			final CommandLine commandLine = PARSER.parse(OPTIONS, args);
@@ -79,6 +77,7 @@ public class Main
 				if (Boolean.parseBoolean(reader.readLine()))
 				{
 					System.out.println("Beginning operation...");
+					startTime = System.currentTimeMillis();
 					final ObjectInputStream objectInputStream = new ObjectInputStream(Files.newInputStream(inputPath));
 					final String outputFilename = (String) objectInputStream.readObject();
 					final long totalSize = objectInputStream.readLong(), chunkSize = objectInputStream.readLong();
@@ -89,12 +88,12 @@ public class Main
 					System.out.println("Thus there should be " + calculatedChunks + " chunks.");
 					if (calculatedChunks != listedChunks)
 						System.err.println("WARNING! Expected " + calculatedChunks + " chunks but got " + listedChunks + " listed chunks!");
-					try (final OutputStream outputStream = new DigestOutputStream(new BufferedOutputStream(Files.newOutputStream(Paths.get(outputPath.toString(), outputFilename))), OUT_DIGEST))
+					try (final OutputStream outputStream = new DigestOutputStream(Files.newOutputStream(Paths.get(outputPath.toString(), outputFilename)), OUT_DIGEST))
 					{
 						for (int i = 1; i < listedChunks + 1; i++)
 						{
 							System.out.println("Reading chunk #" + i + '/' + listedChunks + "...");
-							final Path currentPath = Paths.get(inputPath.getParent().toString(), outputFilename + '.' + (i - 1) + ".part");
+							final Path currentPath = Paths.get(inputPath.getParent().toString(), outputFilename + '.' + i + ".part");
 							final long currentChunkSize = Files.size(currentPath), desiredSize = i < listedChunks + 1 ? chunkSize : totalSize - chunkSize * i;
 							if (desiredSize != chunkSize)
 							{
@@ -103,10 +102,17 @@ public class Main
 								if (!Boolean.parseBoolean(reader.readLine()))
 									System.exit(0);
 							}
-							try (final InputStream inputStream = new DigestInputStream(new BufferedInputStream(Files.newInputStream(currentPath)), IN_DIGEST))
+							try (final InputStream inputStream = new DigestInputStream(Files.newInputStream(currentPath), IN_DIGEST))
 							{
-								while (inputStream.available() > 0)
-									outputStream.write(inputStream.read());
+								long size = Files.size(currentPath);
+								while (size > 0)
+								{
+									final int bufferSize = (int) Math.min(MAX_BUFFER, size);
+									final byte[] buffer = new byte[bufferSize];
+									inputStream.read(buffer);
+									outputStream.write(buffer);
+									size -= bufferSize;
+								}
 								outputStream.flush();
 							}
 							final String realChecksum = bytesToHex(IN_DIGEST.digest()), savedChecksum = (String) objectInputStream.readObject();
@@ -124,6 +130,7 @@ public class Main
 							System.err.println("WARNING! Final file checksum does not match! Expected " + expectedChecksum + " but got " + realChecksum + '!');
 					}
 					System.out.println("Done!");
+					System.out.println(timeFromMillis(System.currentTimeMillis() - startTime));
 				}
 				else
 					cancel();
@@ -142,29 +149,37 @@ public class Main
 				if (Boolean.parseBoolean(reader.readLine()))
 				{
 					System.out.println("Beginning operation...");
+					startTime = System.currentTimeMillis();
 					final ObjectOutputStream objectOutputStream = new ObjectOutputStream(Files.newOutputStream(Paths.get(outputPath.toString(), inputPath.getFileName() + ".sum")));
 					long processed = 0;
 					objectOutputStream.writeObject(inputPath.getFileName().toString());
 					objectOutputStream.writeLong(totalSize);
 					objectOutputStream.writeLong(chunkSize);
 					objectOutputStream.writeInt(totalChunks);
-					try (final InputStream inputStream = new DigestInputStream(new BufferedInputStream(Files.newInputStream(inputPath)), IN_DIGEST))
+					try (final InputStream inputStream = new DigestInputStream(Files.newInputStream(inputPath), IN_DIGEST))
 					{
-						int chunkIndex = 0;
+						int chunkIndex = 1;
 						while (inputStream.available() > 0)
 						{
 							final Path currentChunkPath = Paths.get(outputPath.toString(), inputPath.getFileName().toString() + '.' + chunkIndex + ".part");
-							try (final OutputStream outputStream = new DigestOutputStream(new BufferedOutputStream(Files.newOutputStream(currentChunkPath)), OUT_DIGEST))
+							try (final OutputStream outputStream = new DigestOutputStream(Files.newOutputStream(currentChunkPath), OUT_DIGEST))
 							{
 								final long maxAlloc = Math.min(chunkSize, totalSize - processed);
-								for (long i = 0; i < maxAlloc; i++)
-									outputStream.write(inputStream.read());
+								long written = 0;
+								while (written < maxAlloc)
+								{
+									final int bufferSize = (int) Math.min(MAX_BUFFER, maxAlloc);
+									final byte[] buffer = new byte[bufferSize];
+									inputStream.read(buffer);
+									outputStream.write(buffer);
+									written += bufferSize;
+								}
 
 								outputStream.flush();
 								processed += maxAlloc;
 								objectOutputStream.writeObject(bytesToHex(IN_DIGEST.digest()));
 								objectOutputStream.flush();
-								System.out.println("Wrote: " + currentChunkPath + " at " + maxAlloc + " bytes.");
+								System.out.println(String.format("(#%s/%s) Wrote: %s at %s bytes.", chunkIndex, totalChunks, currentChunkPath, maxAlloc));
 							}
 							chunkIndex++;
 						}
@@ -172,6 +187,7 @@ public class Main
 						objectOutputStream.flush();
 					}
 					System.out.println("Done!");
+					System.out.println(timeFromMillis(System.currentTimeMillis() - startTime));
 				}
 				else
 					cancel();
@@ -214,6 +230,26 @@ public class Main
 			case "KB":
 			default: return KB;
 		}
+	}
+	
+	private static String timeFromMillis(long timeIn)
+	{
+		final StringBuilder builder = new StringBuilder("Operation took: ");
+		final long secondMillis = 1000, minuteMillis = 60 * secondMillis, hourMillis = 60 * minuteMillis;
+		long time = timeIn;
+		if (time >= hourMillis)
+		{
+			builder.append(Math.floorDiv(time, hourMillis)).append(" hour(s) ");
+			time %= hourMillis;
+		}
+		if (time >= minuteMillis)
+		{
+			builder.append(Math.floorDiv(time, minuteMillis)).append(" minute(s) ");
+			time %= minuteMillis;
+		}
+		if (time >= secondMillis)
+			builder.append((double) time / secondMillis).append(" second(s)");
+		return builder.append('.').toString();
 	}
 	
 	private static void cancel()
